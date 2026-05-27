@@ -79,6 +79,9 @@ def main() -> None:
         if step >= 15:
             break
         images = batch["image"].to(device)
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
         prompt_ids, prompt_mask = batch_prompt_tensors(
             batch, tokenizer=tokenizer, max_length=model.cfg.lm_max_length, device=device
         )
@@ -88,11 +91,15 @@ def main() -> None:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 h = last_hidden_after_prompt(model, prompt_ids, images, attention_mask=prompt_mask)
                 pos = positive_action_mask(batch.get("allowed_actions"), h.size(0), device, dtype=h.dtype)
-                loss = optimal_set_log_loss(h, action_emb, pos)
+                emb_loss = optimal_set_log_loss(h, action_emb, pos)
+                _, ce_loss = model(input_ids, images, attention_mask, targets=labels)
+                loss = emb_loss + ce_loss
         else:
             h = last_hidden_after_prompt(model, prompt_ids, images, attention_mask=prompt_mask)
             pos = positive_action_mask(batch.get("allowed_actions"), h.size(0), device, dtype=h.dtype)
-            loss = optimal_set_log_loss(h, action_emb, pos)
+            emb_loss = optimal_set_log_loss(h, action_emb, pos)
+            _, ce_loss = model(input_ids, images, attention_mask, targets=labels)
+            loss = emb_loss + ce_loss
         loss.backward()
         opt.step()
         losses.append(loss.item())

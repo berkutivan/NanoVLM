@@ -114,11 +114,16 @@ def main() -> None:
             truncation=True,
             max_length=model.cfg.lm_max_length,
         )
+        from action_logloss import action_first_token_ids
+
+        first_action_toks = action_first_token_ids(tokenizer, device)
         gen = model.generate(
             enc["input_ids"].to(device),
             images[:1],
             enc["attention_mask"].to(device),
             max_new_tokens=8,
+            do_sample=False,
+            restrict_first_token_to=first_action_toks,
         )
         pred = tokenizer.batch_decode(gen, skip_special_tokens=True)[0]
     print("generate sample pred:", repr(pred[:80]))

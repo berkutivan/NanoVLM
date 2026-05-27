@@ -38,3 +38,6 @@ class SFTConfig:
     use_amp: bool = True  # only applied when CUDA is available
 
     max_objects: int | None = None  # debug: cap number of mazes
+
+    # CE on answer tokens (trains lm_head); combined with embedding log-loss
+    ce_loss_weight: float = 1.0

@@ -8,9 +8,8 @@ Fine-tuning strategy
 3. Optimize all parameters with two learning rates (nanoVLM convention):
    - modality projector (MP): higher LR — adapts vision tokens to the new task quickly;
    - vision encoder + language decoder: lower LR — preserves general VLM features while adapting.
-4. Loss: binary log-loss on the **set of optimal** next actions (shortest path on (x, y, direction)).
-   Reference embeddings for ``left`` / ``right`` / ``forward`` are built from the LM embedding table;
-   the model state is the last hidden vector at the end of the prompt (no string normalization).
+4. Loss: optimal-set embedding log-loss + CE on answer tokens (trains ``lm_head``).
+   Validation reports embedding accuracy (aligned with log-loss) and constrained greedy gen accuracy.
 """
 
 from __future__ import annotations
@@ -36,8 +35,12 @@ for p in (str(NANOVLM_DIR), str(DATASETS_DIR)):
 from action_logloss import (  # noqa: E402
     ACTION_ORDER,
     action_embedding_matrix,
+    action_first_token_ids,
+    count_allowed_hits,
     optimal_set_log_loss,
     positive_action_mask,
+    predict_actions_from_hidden,
+    actions_from_first_token_ids,
 )
 from data.processors import get_image_processor, get_tokenizer  # noqa: E402
 from minigrid_collator import (  # noqa: E402
@@ -90,14 +93,24 @@ def eval_metrics(
     model: VisionLanguageModel,
     tokenizer,
     loader: DataLoader,
-    dataset: MiniGridSFTDataset,
     device: torch.device,
     max_new_tokens: int = 8,
-) -> tuple[float, float]:
-    """Validation log-loss (optimal-set) and greedy decode accuracy vs allowed optimal actions."""
+) -> tuple[float, float, float]:
+    """
+    Returns (val_logloss, val_emb_acc, val_gen_acc).
+
+    val_emb_acc: argmax over action embeddings (aligned with training loss).
+    val_gen_acc: greedy decode, first token restricted to action prefixes.
+    """
     model.eval()
     total_loss = 0.0
+    emb_hits = 0
+    gen_hits = 0
+    n_samples = 0
     n_batches = 0
+
+    action_emb = action_embedding_matrix(model, tokenizer, device)
+    first_action_toks = action_first_token_ids(tokenizer, device)
 
     for batch in loader:
         images = batch["image"].to(device)
@@ -109,46 +122,31 @@ def eval_metrics(
         )
         allowed = batch.get("allowed_actions")
 
-        action_emb = action_embedding_matrix(model, tokenizer, device)
         h = last_hidden_after_prompt(model, prompt_ids, images, attention_mask=prompt_mask)
         pos = positive_action_mask(allowed, h.size(0), device, dtype=h.dtype)
         total_loss += optimal_set_log_loss(h, action_emb, pos).item()
         n_batches += 1
 
-    correct = 0
-    total = 0
-    batch_size = loader.batch_size or 8
-    for start in range(0, len(dataset), batch_size):
-        chunk_idx = list(range(start, min(start + batch_size, len(dataset))))
-        items = [dataset[i] for i in chunk_idx]
-        images = torch.stack([it["image"] for it in items]).to(device)
-        prompts = [it["text_data"] for it in items]
-        allowed_list = [tuple(it.get("allowed_actions") or (it["action"],)) for it in items]
+        emb_preds = predict_actions_from_hidden(h, action_emb)
+        emb_hits += count_allowed_hits(emb_preds, allowed)
 
-        encoded = tokenizer(
-            prompts,
-            padding=True,
-            padding_side="left",
-            return_tensors="pt",
-            truncation=True,
-            max_length=model.cfg.lm_max_length,
+        gen = model.generate(
+            prompt_ids,
+            images,
+            prompt_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            restrict_first_token_to=first_action_toks,
         )
-        input_ids = encoded["input_ids"].to(device)
-        attention_mask = encoded["attention_mask"].to(device)
-
-        gen = model.generate(input_ids, images, attention_mask, max_new_tokens=max_new_tokens)
-        preds = tokenizer.batch_decode(gen, skip_special_tokens=True)
-
-        for pred, allowed in zip(preds, allowed_list):
-            a = first_grid_action(pred)
-            if a in set(allowed):
-                correct += 1
-            total += 1
+        gen_preds = actions_from_first_token_ids(gen[:, 0], first_action_toks)
+        gen_hits += count_allowed_hits(gen_preds, allowed)
+        n_samples += h.size(0)
 
     model.train()
-    acc = correct / total if total else 0.0
     avg_loss = total_loss / max(n_batches, 1)
-    return acc, avg_loss
+    emb_acc = emb_hits / n_samples if n_samples else 0.0
+    gen_acc = gen_hits / n_samples if n_samples else 0.0
+    return avg_loss, emb_acc, gen_acc
 
 
 def train_sft(cfg: SFTConfig) -> None:
@@ -239,7 +237,10 @@ def train_sft(cfg: SFTConfig) -> None:
         f"Training: {cfg.epochs} epochs, batch_size={cfg.batch_size}, "
         f"lr_mp={cfg.lr_mp}, lr_backbones={cfg.lr_backbones}"
     )
-    log("Loss: optimal-set log-loss (max cosine sim to any optimal action -> -log p)")
+    log(
+        "Loss: optimal-set log-loss + CE on answer tokens "
+        f"(ce_weight={cfg.ce_loss_weight})"
+    )
     log("-" * 60)
 
     for epoch in range(cfg.epochs):
@@ -250,6 +251,9 @@ def train_sft(cfg: SFTConfig) -> None:
 
         for batch_idx, batch in enumerate(train_loader):
             images = batch["image"].to(device)
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
             prompt_ids, prompt_mask = batch_prompt_tensors(
                 batch,
                 tokenizer=tokenizer,
@@ -266,7 +270,9 @@ def train_sft(cfg: SFTConfig) -> None:
                         model, prompt_ids, images, attention_mask=prompt_mask
                     )
                     pos = positive_action_mask(allowed, h.size(0), device, dtype=h.dtype)
-                    loss = optimal_set_log_loss(h, action_emb, pos)
+                    emb_loss = optimal_set_log_loss(h, action_emb, pos)
+                    _, ce_loss = model(input_ids, images, attention_mask, targets=labels)
+                    loss = emb_loss + cfg.ce_loss_weight * ce_loss
                 loss = loss / cfg.grad_accum_steps
                 loss.backward()
             else:
@@ -274,7 +280,9 @@ def train_sft(cfg: SFTConfig) -> None:
                     model, prompt_ids, images, attention_mask=prompt_mask
                 )
                 pos = positive_action_mask(allowed, h.size(0), device, dtype=h.dtype)
-                loss = optimal_set_log_loss(h, action_emb, pos)
+                emb_loss = optimal_set_log_loss(h, action_emb, pos)
+                _, ce_loss = model(input_ids, images, attention_mask, targets=labels)
+                loss = emb_loss + cfg.ce_loss_weight * ce_loss
                 loss = loss / cfg.grad_accum_steps
                 loss.backward()
 
@@ -302,25 +310,28 @@ def train_sft(cfg: SFTConfig) -> None:
                 )
 
             if global_step > 0 and global_step % cfg.eval_every == 0:
-                val_acc, val_loss = eval_metrics(
-                    model, tokenizer, val_loader, val_ds, device
+                val_loss, val_emb_acc, val_gen_acc = eval_metrics(
+                    model, tokenizer, val_loader, device
                 )
                 log(
-                    f"  >> val_logloss={val_loss:.4f} | val_allowed_acc={val_acc * 100:.2f}%"
+                    f"  >> val_logloss={val_loss:.4f} | val_emb_acc={val_emb_acc * 100:.2f}% "
+                    f"| val_gen_acc={val_gen_acc * 100:.2f}%"
                 )
-                if val_acc > best_val_acc:
-                    best_val_acc = val_acc
+                if val_gen_acc > best_val_acc:
+                    best_val_acc = val_gen_acc
                     save_path = out_dir / "best"
                     model.save_pretrained(str(save_path))
                     log(f"  >> saved best checkpoint to {save_path}")
 
         avg_train = epoch_loss / max(epoch_batches, 1)
-        val_acc, val_loss = eval_metrics(model, tokenizer, val_loader, val_ds, device)
+        val_loss, val_emb_acc, val_gen_acc = eval_metrics(
+            model, tokenizer, val_loader, device
+        )
         elapsed = time.time() - t_epoch
         log(
             f"Epoch {epoch + 1} done in {elapsed:.1f}s | "
             f"avg_train_logloss={avg_train:.4f} | val_logloss={val_loss:.4f} | "
-            f"val_allowed_acc={val_acc * 100:.2f}%"
+            f"val_emb_acc={val_emb_acc * 100:.2f}% | val_gen_acc={val_gen_acc * 100:.2f}%"
         )
 
         if cfg.save_every_epoch:
@@ -332,9 +343,9 @@ def train_sft(cfg: SFTConfig) -> None:
     model.save_pretrained(str(final_path))
     log("=" * 60)
     if best_val_acc >= 0:
-        log(f"Done. Best val allowed acc: {best_val_acc * 100:.2f}%")
+        log(f"Done. Best val gen acc: {best_val_acc * 100:.2f}%")
     else:
-        log("Done. No checkpoint saved by val_allowed_acc (eval_every may be larger than steps).")
+        log("Done. No checkpoint saved by val_gen_acc (eval_every may be larger than steps).")
     log(f"Last weights: {final_path}")
     log("=" * 60)
 

@@ -97,7 +97,16 @@ class VisionLanguageModel(nn.Module):
         return hidden_text[row, last_idx, :]
 
     @torch.no_grad()
-    def generate(self, input_ids, image, attention_mask=None, max_new_tokens=5):
+    def generate(
+        self,
+        input_ids,
+        image,
+        attention_mask=None,
+        max_new_tokens=5,
+        *,
+        do_sample: bool = False,
+        restrict_first_token_to: torch.Tensor | None = None,
+    ):
         # Process image through vision encoder and projection
         image_embd = self.vision_encoder(image)
         image_embd = self.MP(image_embd)
@@ -133,8 +142,16 @@ class VisionLanguageModel(nn.Module):
             if not self.decoder.lm_use_tokens:
                 last_token_logits = self.decoder.head(last_token_logits)
 
-            probs = torch.softmax(last_token_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            if restrict_first_token_to is not None and i == 0:
+                restricted = last_token_logits.clone()
+                mask = torch.full_like(restricted, float("-inf"))
+                mask[:, restrict_first_token_to] = restricted[:, restrict_first_token_to]
+                next_token = torch.argmax(mask, dim=-1, keepdim=True)
+            elif do_sample:
+                probs = torch.softmax(last_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(last_token_logits, dim=-1, keepdim=True)
                 
             generated_tokens[:, i] = next_token.squeeze(-1)
             

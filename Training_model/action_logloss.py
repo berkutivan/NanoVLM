@@ -117,3 +117,51 @@ def optimal_set_log_loss(
         max_sim = torch.where(bad, sims.max(dim=1).values, max_sim)
     p = ((max_sim + 1.0) * 0.5).clamp(eps, 1.0 - eps)
     return (-torch.log(p)).mean()
+
+
+def action_cosine_similarities(h: torch.Tensor, action_emb: torch.Tensor) -> torch.Tensor:
+    """Cosine similarity [B, 3] between prompt hidden states and action embeddings."""
+    ref = action_emb.detach()
+    return F.cosine_similarity(h.unsqueeze(1), ref.unsqueeze(0), dim=-1)
+
+
+def predict_actions_from_hidden(h: torch.Tensor, action_emb: torch.Tensor) -> list[str]:
+    """Argmax over left / right / forward by embedding cosine similarity."""
+    sims = action_cosine_similarities(h, action_emb)
+    indices = sims.argmax(dim=1).tolist()
+    return [ACTION_ORDER[i] for i in indices]
+
+
+@torch.no_grad()
+def action_first_token_ids(tokenizer, device: torch.device) -> torch.Tensor:
+    """First subword id for each answer prefix ``" {action}"`` (for constrained decode)."""
+    ids: list[int] = []
+    for a in ACTION_ORDER:
+        encoded = tokenizer.encode(f" {a}", add_special_tokens=False)
+        if not encoded:
+            raise ValueError(f"tokenizer produced no ids for action {a!r}")
+        ids.append(encoded[0])
+    return torch.tensor(ids, device=device, dtype=torch.long)
+
+
+def count_allowed_hits(
+    predicted: list[str],
+    allowed_per_sample: list[list[str] | None],
+) -> int:
+    hits = 0
+    for pred, allowed in zip(predicted, allowed_per_sample):
+        opts = allowed if allowed is not None else list(ACTION_ORDER)
+        if pred in set(opts):
+            hits += 1
+    return hits
+
+
+def actions_from_first_token_ids(
+    token_ids: torch.Tensor,
+    first_token_ids: torch.Tensor,
+) -> list[str]:
+    """Map generated first token ids to action names (restricted decode)."""
+    mapping = {
+        int(tid): ACTION_ORDER[i] for i, tid in enumerate(first_token_ids.tolist())
+    }
+    return [mapping.get(int(t), "") for t in token_ids.tolist()]
