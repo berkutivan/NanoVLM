@@ -126,20 +126,39 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         v = v.repeat_interleave(self.n_kv_groups, dim=1)
 
         # Process attention mask if provided
+        padding_mask = None
         if attention_mask is not None:
             # Create a 4D attention mask [batch_size, 1, 1, seq_length], In this format, 1 = attend, 0 = mask
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, T]
-            padding_mask = (attention_mask == 0).transpose(-1, -2) # Use this for the manual path
+            padding_mask = (attention_mask == 0).transpose(-1, -2)  # Use this for the manual path
             # Convert to attention mask where 0 keeps values and -inf masks
             attention_mask = (1.0 - attention_mask) * torch.finfo(q.dtype).min
 
         if self.sdpa:
-            y = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attention_mask,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=True # LM attention is causal (masked)
-            )
+            # PyTorch SDPA: cannot pass explicit attn_mask together with is_causal=True.
+            if attention_mask is not None:
+                causal_mask = torch.triu(
+                    torch.full((T, T), float("-inf"), device=x.device, dtype=q.dtype),
+                    diagonal=1,
+                ).view(1, 1, T, T)
+                sdpa_mask = causal_mask + attention_mask
+                y = torch.nn.functional.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=sdpa_mask,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=False,
+                )
+            else:
+                y = torch.nn.functional.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=None,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=True,
+                )
         else:
             attn = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
             causal_mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
