@@ -2,3 +2,7 @@ Description_project.md
 checkpoints/
 *.zip
 .venv/
+
+__pycache__/
+*.pyc
+
