@@ -12,6 +12,7 @@ class MiniGridSFTCollator:
         images = torch.stack([item["image"] for item in batch])
         texts = [item["text_data"] for item in batch]
         answers = [item["answer"] for item in batch]
+        allowed_actions = [item.get("allowed_actions") for item in batch]
 
         input_sequences = [f"{texts[i]}{answers[i]}" for i in range(len(batch))]
 
@@ -52,4 +53,5 @@ class MiniGridSFTCollator:
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
+            "allowed_actions": allowed_actions,
         }

@@ -83,6 +83,7 @@ class MiniGridSFTDataset(Dataset):
             "text_data": prompt,
             "answer": answer,
             "action": step.action,
+            "allowed_actions": list(step.allowed_actions),
             "object_id": self.objects[obj_idx].get("id", obj_idx),
             "step_index": step.step_index,
         }

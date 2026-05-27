@@ -31,6 +31,7 @@ class ExpertStep:
     mission: str
     action: str
     action_id: int
+    allowed_actions: tuple[str, ...]
     step_index: int
 
 
@@ -102,6 +103,89 @@ def plan_expert_actions(obj: dict[str, Any]) -> list[str]:
     raise RuntimeError(f"object id={obj.get('id')}: no path from start to goal")
 
 
+def _compute_state_distances(
+    layout: dict[str, Any],
+) -> dict[tuple[int, int, int], int]:
+    """
+    Compute shortest distance (#actions) from every reachable (x,y,dir) to the goal.
+
+    We do a reverse BFS from all goal states (goal_x, goal_y, dir in 0..3).
+    """
+    walkable = _walkable_cells(layout)
+    goal = tuple(layout["goal_pos"])
+    if goal not in walkable:
+        return {}
+
+    dist: dict[tuple[int, int, int], int] = {}
+    q: deque[tuple[int, int, int]] = deque()
+    for d in range(4):
+        s = (goal[0], goal[1], d)
+        dist[s] = 0
+        q.append(s)
+
+    while q:
+        x, y, d = q.popleft()
+        cur = dist[(x, y, d)]
+
+        # Predecessors via turns:
+        # If we are at (x,y,d) now, we could have come from:
+        # - action 'left' from (x,y, turn_right(d))
+        # - action 'right' from (x,y, turn_left(d))
+        pred_left = (x, y, _turn_right(d))
+        pred_right = (x, y, _turn_left(d))
+        for ps in (pred_left, pred_right):
+            if ps not in dist:
+                dist[ps] = cur + 1
+                q.append(ps)
+
+        # Predecessor via forward:
+        # If we are at (x,y,d) now, we could have come from (x-dx, y-dy, d) with action 'forward'
+        dx, dy = _DIR_VEC[d]
+        px, py = x - dx, y - dy
+        if (px, py) in walkable:
+            ps = (px, py, d)
+            if ps not in dist:
+                dist[ps] = cur + 1
+                q.append(ps)
+
+    return dist
+
+
+def _allowed_optimal_actions(
+    state: tuple[int, int, int],
+    *,
+    walkable: set[tuple[int, int]],
+    dist: dict[tuple[int, int, int], int],
+) -> tuple[str, ...]:
+    """
+    Return all actions that keep the path length optimal (i.e. reduce dist by 1).
+    """
+    if state not in dist:
+        return tuple()
+    x, y, d = state
+    cur = dist[state]
+    allowed: list[str] = []
+
+    # left / right always valid
+    for action in ("left", "right"):
+        if action == "left":
+            ns = (x, y, _turn_left(d))
+        else:
+            ns = (x, y, _turn_right(d))
+        if dist.get(ns, 10**9) == cur - 1:
+            allowed.append(action)
+
+    # forward only if walkable
+    nx, ny = _forward_cell(x, y, d)
+    if (nx, ny) in walkable:
+        ns = (nx, ny, d)
+        if dist.get(ns, 10**9) == cur - 1:
+            allowed.append("forward")
+
+    # Fallback: if something is off, at least allow the expert path to remain usable
+    return tuple(allowed)
+
+
 def make_env_from_object(obj: dict[str, Any]):
     layout = obj["layout"]
     pred = obj["predicate_space"]
@@ -122,18 +206,30 @@ def make_env_from_object(obj: dict[str, Any]):
 def rollout_expert_trajectory(obj: dict[str, Any]) -> list[ExpertStep]:
     """RGB observation before each expert action until the goal is reached."""
     actions = plan_expert_actions(obj)
+    layout = obj["layout"]
+    walkable = _walkable_cells(layout)
+    dist = _compute_state_distances(layout)
     env = make_env_from_object(obj)
     obs, _ = env.reset(seed=obj["seed"])
     mission = str(obs["mission"])
     steps: list[ExpertStep] = []
 
     for step_index, action in enumerate(actions):
+        # Compute allowed optimal actions for the CURRENT state (before executing expert action)
+        # MiniGrid keeps agent state on env.unwrapped
+        ax, ay = int(env.unwrapped.agent_pos[0]), int(env.unwrapped.agent_pos[1])
+        ad = int(env.unwrapped.agent_dir)
+        allowed = _allowed_optimal_actions((ax, ay, ad), walkable=walkable, dist=dist)
+        if not allowed:
+            allowed = (action,)
+
         steps.append(
             ExpertStep(
                 image=np.asarray(obs["image"], dtype=np.uint8),
                 mission=mission,
                 action=action,
                 action_id=_ACTION_TO_ID[action],
+                allowed_actions=allowed,
                 step_index=step_index,
             )
         )
