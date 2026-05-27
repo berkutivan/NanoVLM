@@ -1,6 +1,9 @@
 """
 BFS expert on (x, y, direction) and rollout for SFT samples.
 
+The planning graph has one vertex per (cell, facing): left/right only change facing;
+forward moves to an adjacent cell if there is no wall. This matches MiniGrid physics.
+
 Uses layout from pre_sample objects; RGB frames from MazePreSampleBuilder env.
 """
 

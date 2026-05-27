@@ -58,6 +58,44 @@ class VisionLanguageModel(nn.Module):
 
         return logits, loss
 
+    def last_hidden_after_prompt(
+        self, input_ids: torch.Tensor, image: torch.Tensor, attention_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """
+        Hidden state at the last real text token (before any answer), after LM blocks + final RMSNorm,
+        before the LM head. Uses the same prefix layout as ``forward`` (image tokens + text tokens).
+
+        ``attention_mask`` must match the text ``input_ids`` rows (1 = real token, 0 = pad). Works with
+        left-padded batches: the last attended text position is used.
+        """
+        image_embd = self.vision_encoder(image)
+        image_embd = self.MP(image_embd)
+        token_embd = self.decoder.token_embedding(input_ids)
+        combined_embd = torch.cat((image_embd, token_embd), dim=1)
+
+        if attention_mask is not None:
+            batch_size = image_embd.size(0)
+            img_seq_len = image_embd.size(1)
+            image_attention_mask = torch.ones(
+                (batch_size, img_seq_len),
+                device=attention_mask.device,
+                dtype=attention_mask.dtype,
+            )
+            attention_mask_full = torch.cat((image_attention_mask, attention_mask), dim=1)
+        else:
+            attention_mask_full = None
+
+        hidden = self.decoder(combined_embd, attention_mask_full)
+        hidden_text = hidden[:, image_embd.size(1) :, :]
+
+        if attention_mask is None:
+            return hidden_text[:, -1, :]
+
+        b = hidden_text.size(0)
+        last_idx = attention_mask.sum(dim=1).long().clamp(min=1) - 1
+        row = torch.arange(b, device=hidden_text.device)
+        return hidden_text[row, last_idx, :]
+
     @torch.no_grad()
     def generate(self, input_ids, image, attention_mask=None, max_new_tokens=5):
         # Process image through vision encoder and projection

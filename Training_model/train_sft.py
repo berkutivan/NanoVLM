@@ -8,7 +8,9 @@ Fine-tuning strategy
 3. Optimize all parameters with two learning rates (nanoVLM convention):
    - modality projector (MP): higher LR — adapts vision tokens to the new task quickly;
    - vision encoder + language decoder: lower LR — preserves general VLM features while adapting.
-4. Loss: causal LM cross-entropy only on the action tokens (prompt masked via VQACollator).
+4. Loss: binary log-loss on the **set of optimal** next actions (shortest path on (x, y, direction)).
+   Reference embeddings for ``left`` / ``right`` / ``forward`` are built from the LM embedding table;
+   the model state is the last hidden vector at the end of the prompt (no string normalization).
 """
 
 from __future__ import annotations
@@ -31,8 +33,18 @@ for p in (str(NANOVLM_DIR), str(DATASETS_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+from action_logloss import (  # noqa: E402
+    ACTION_ORDER,
+    action_embedding_matrix,
+    optimal_set_log_loss,
+    positive_action_mask,
+)
 from data.processors import get_image_processor, get_tokenizer  # noqa: E402
-from minigrid_collator import MiniGridSFTCollator  # noqa: E402
+from minigrid_collator import (  # noqa: E402
+    MiniGridSFTCollator,
+    batch_prompt_tensors,
+    last_hidden_after_prompt,
+)
 from models.vision_language_model import VisionLanguageModel  # noqa: E402
 
 from minigrid_sft_dataset import (  # noqa: E402
@@ -64,12 +76,13 @@ def get_lr(step: int, max_lr: float, max_steps: int) -> float:
     return min_lr + coeff * (max_lr - min_lr)
 
 
-def normalize_action(text: str) -> str:
-    t = text.strip().lower()
-    for name in ("forward", "left", "right"):
-        if name in t:
-            return name
-    return t.split()[0] if t else ""
+def first_grid_action(text: str) -> str:
+    """First whitespace-delimited token if it is a valid MiniGrid action (no fuzzy substring match)."""
+    t = (text or "").strip().lower().split()
+    if not t:
+        return ""
+    w = t[0].rstrip(".,;:!?")
+    return w if w in ACTION_ORDER else ""
 
 
 @torch.no_grad()
@@ -81,18 +94,25 @@ def eval_metrics(
     device: torch.device,
     max_new_tokens: int = 8,
 ) -> tuple[float, float]:
-    """Validation loss (teacher-forced) and greedy action accuracy."""
+    """Validation log-loss (optimal-set) and greedy decode accuracy vs allowed optimal actions."""
     model.eval()
     total_loss = 0.0
     n_batches = 0
 
     for batch in loader:
         images = batch["image"].to(device)
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
-        total_loss += loss.item()
+        prompt_ids, prompt_mask = batch_prompt_tensors(
+            batch,
+            tokenizer=tokenizer,
+            max_length=model.cfg.lm_max_length,
+            device=device,
+        )
+        allowed = batch.get("allowed_actions")
+
+        action_emb = action_embedding_matrix(model, tokenizer, device)
+        h = last_hidden_after_prompt(model, prompt_ids, images, attention_mask=prompt_mask)
+        pos = positive_action_mask(allowed, h.size(0), device, dtype=h.dtype)
+        total_loss += optimal_set_log_loss(h, action_emb, pos).item()
         n_batches += 1
 
     correct = 0
@@ -103,7 +123,7 @@ def eval_metrics(
         items = [dataset[i] for i in chunk_idx]
         images = torch.stack([it["image"] for it in items]).to(device)
         prompts = [it["text_data"] for it in items]
-        gold = [it["action"] for it in items]
+        allowed_list = [tuple(it.get("allowed_actions") or (it["action"],)) for it in items]
 
         encoded = tokenizer(
             prompts,
@@ -119,8 +139,9 @@ def eval_metrics(
         gen = model.generate(input_ids, images, attention_mask, max_new_tokens=max_new_tokens)
         preds = tokenizer.batch_decode(gen, skip_special_tokens=True)
 
-        for pred, g in zip(preds, gold):
-            if normalize_action(pred) == g:
+        for pred, allowed in zip(preds, allowed_list):
+            a = first_grid_action(pred)
+            if a in set(allowed):
                 correct += 1
             total += 1
 
@@ -148,7 +169,7 @@ def train_sft(cfg: SFTConfig) -> None:
     train_objs, val_objs = split_objects(objects, cfg.val_ratio, cfg.seed)
     log(f"Train mazes: {len(train_objs)} | Val mazes: {len(val_objs)}")
 
-    log("Precomputing expert trajectories (BFS)...")
+    log("Precomputing expert trajectories (BFS on x,y,dir)...")
     t0 = time.time()
     train_cache = precompute_trajectories(train_objs)
     val_cache = precompute_trajectories(val_objs)
@@ -218,6 +239,7 @@ def train_sft(cfg: SFTConfig) -> None:
         f"Training: {cfg.epochs} epochs, batch_size={cfg.batch_size}, "
         f"lr_mp={cfg.lr_mp}, lr_backbones={cfg.lr_backbones}"
     )
+    log("Loss: optimal-set log-loss (max cosine sim to any optimal action -> -log p)")
     log("-" * 60)
 
     for epoch in range(cfg.epochs):
@@ -228,21 +250,31 @@ def train_sft(cfg: SFTConfig) -> None:
 
         for batch_idx, batch in enumerate(train_loader):
             images = batch["image"].to(device)
-            input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
+            prompt_ids, prompt_mask = batch_prompt_tensors(
+                batch,
+                tokenizer=tokenizer,
+                max_length=model.cfg.lm_max_length,
+                device=device,
+            )
+            allowed = batch.get("allowed_actions")
+
+            action_emb = action_embedding_matrix(model, tokenizer, device)
 
             if use_amp:
                 with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                    _, loss = model(
-                        input_ids, images, attention_mask=attention_mask, targets=labels
+                    h = last_hidden_after_prompt(
+                        model, prompt_ids, images, attention_mask=prompt_mask
                     )
+                    pos = positive_action_mask(allowed, h.size(0), device, dtype=h.dtype)
+                    loss = optimal_set_log_loss(h, action_emb, pos)
                 loss = loss / cfg.grad_accum_steps
                 loss.backward()
             else:
-                _, loss = model(
-                    input_ids, images, attention_mask=attention_mask, targets=labels
+                h = last_hidden_after_prompt(
+                    model, prompt_ids, images, attention_mask=prompt_mask
                 )
+                pos = positive_action_mask(allowed, h.size(0), device, dtype=h.dtype)
+                loss = optimal_set_log_loss(h, action_emb, pos)
                 loss = loss / cfg.grad_accum_steps
                 loss.backward()
 
@@ -266,7 +298,7 @@ def train_sft(cfg: SFTConfig) -> None:
                 lr_bb = optimizer.param_groups[1]["lr"]
                 log(
                     f"[epoch {epoch + 1}/{cfg.epochs}] step {global_step} | "
-                    f"train_loss={loss_val:.4f} | lr_mp={lr_mp:.2e} lr_bb={lr_bb:.2e}"
+                    f"train_logloss={loss_val:.4f} | lr_mp={lr_mp:.2e} lr_bb={lr_bb:.2e}"
                 )
 
             if global_step > 0 and global_step % cfg.eval_every == 0:
@@ -274,7 +306,7 @@ def train_sft(cfg: SFTConfig) -> None:
                     model, tokenizer, val_loader, val_ds, device
                 )
                 log(
-                    f"  >> val_loss={val_loss:.4f} | val_action_acc={val_acc * 100:.2f}%"
+                    f"  >> val_logloss={val_loss:.4f} | val_allowed_acc={val_acc * 100:.2f}%"
                 )
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
@@ -287,8 +319,8 @@ def train_sft(cfg: SFTConfig) -> None:
         elapsed = time.time() - t_epoch
         log(
             f"Epoch {epoch + 1} done in {elapsed:.1f}s | "
-            f"avg_train_loss={avg_train:.4f} | val_loss={val_loss:.4f} | "
-            f"val_action_acc={val_acc * 100:.2f}%"
+            f"avg_train_logloss={avg_train:.4f} | val_logloss={val_loss:.4f} | "
+            f"val_allowed_acc={val_acc * 100:.2f}%"
         )
 
         if cfg.save_every_epoch:
@@ -299,7 +331,10 @@ def train_sft(cfg: SFTConfig) -> None:
     final_path = out_dir / "last"
     model.save_pretrained(str(final_path))
     log("=" * 60)
-    log(f"Done. Best val action acc: {best_val_acc * 100:.2f}%")
+    if best_val_acc >= 0:
+        log(f"Done. Best val allowed acc: {best_val_acc * 100:.2f}%")
+    else:
+        log("Done. No checkpoint saved by val_allowed_acc (eval_every may be larger than steps).")
     log(f"Last weights: {final_path}")
     log("=" * 60)
 
