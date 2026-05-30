@@ -13,7 +13,15 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-ACTION_ORDER = ("left", "right", "forward")
+ACTION_ORDER = (
+    "left",
+    "right",
+    "forward",
+    "pickup",
+    "drop",
+    "toggle",
+    "done",
+)
 
 try:
     from minigrid_collator import last_hidden_after_prompt  # noqa: E402
@@ -75,7 +83,7 @@ def positive_action_mask(
     device: torch.device,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Shape [B, 3], 1.0 where the action is in the optimal set for that sample."""
+    """Shape [B, len(ACTION_ORDER)], 1.0 where the action is in the optimal set for that sample."""
     m = torch.zeros(batch_size, len(ACTION_ORDER), device=device, dtype=dtype)
     if allowed_per_sample is None:
         return m.fill_(1.0)
@@ -97,10 +105,10 @@ def optimal_set_log_loss(
 ) -> torch.Tensor:
     """
     h: [B, H] last prompt hidden (gradients OK).
-    action_emb: [3, H] reference vectors (expected detached).
-    positive_mask: [B, 3] 1 for optimal actions at this state.
+    action_emb: [len(ACTION_ORDER), H] reference vectors (expected detached).
+    positive_mask: [B, len(ACTION_ORDER)] 1 for optimal actions at this state.
 
-    For each sample, sims = cosine_sim(h, e_k) for k in {0,1,2}.
+    For each sample, sims = cosine_sim(h, e_k) for k in ACTION_ORDER.
     p = max_{k: mask_k=1} sims_k  (best alignment to any correct action).
     Map cosine similarity from [-1, 1] to (0, 1) via (sim + 1) / 2, then -log(p) with clamping.
 
@@ -120,13 +128,13 @@ def optimal_set_log_loss(
 
 
 def action_cosine_similarities(h: torch.Tensor, action_emb: torch.Tensor) -> torch.Tensor:
-    """Cosine similarity [B, 3] between prompt hidden states and action embeddings."""
+    """Cosine similarity [B, len(ACTION_ORDER)] between prompt hidden states and action embeddings."""
     ref = action_emb.detach()
     return F.cosine_similarity(h.unsqueeze(1), ref.unsqueeze(0), dim=-1)
 
 
 def predict_actions_from_hidden(h: torch.Tensor, action_emb: torch.Tensor) -> list[str]:
-    """Argmax over left / right / forward by embedding cosine similarity."""
+    """Argmax over BabyAI actions by embedding cosine similarity."""
     sims = action_cosine_similarities(h, action_emb)
     indices = sims.argmax(dim=1).tolist()
     return [ACTION_ORDER[i] for i in indices]

@@ -1,12 +1,18 @@
 """Hyperparameters for MiniGrid SFT fine-tuning of nanoVLM-222M."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DATASET_JSON = ROOT / "Datasets" / "dataset.json"
 PRETRAINED_CKPT = ROOT / "checkpoints" / "nanoVLM-222M"
 SFT_OUTPUT_DIR = ROOT / "checkpoints" / "sft-minigrid"
+
+DEFAULT_MINARI_DATASETS: tuple[str, ...] = (
+    "minigrid/BabyAI-GoToObjMazeOpen/optimal-v0",
+    "minigrid/BabyAI-GoToObjMaze/optimal-v0",
+    "minigrid/BabyAI-Open/optimal-v0",
+)
 
 
 @dataclass
@@ -15,6 +21,13 @@ class SFTConfig:
     pretrained_path: str = str(PRETRAINED_CKPT)
     output_dir: str = str(SFT_OUTPUT_DIR)
 
+    # Minari BabyAI maze/navigation (Variant A)
+    minari_datasets: list[str] = field(default_factory=lambda: list(DEFAULT_MINARI_DATASETS))
+    minari_download: bool = True
+    minari_tile_size: int = 8
+    max_episodes_per_dataset: int | None = None
+
+    # Legacy JSON maze dataset (unused when minari_datasets is non-empty)
     dataset_path: str = str(DATASET_JSON)
     val_ratio: float = 0.1
     seed: int = 0
@@ -37,7 +50,9 @@ class SFTConfig:
     compile_model: bool = False
     use_amp: bool = True  # only applied when CUDA is available
 
-    max_objects: int | None = None  # debug: cap number of mazes
+    max_objects: int | None = None  # debug: cap legacy JSON mazes
 
     # CE on answer tokens (trains lm_head); combined with embedding log-loss
     ce_loss_weight: float = 1.0
+
+    replay_log_every: int = 100

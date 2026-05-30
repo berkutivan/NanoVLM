@@ -52,8 +52,11 @@ from models.vision_language_model import VisionLanguageModel  # noqa: E402
 
 from minigrid_sft_dataset import (  # noqa: E402
     MiniGridSFTDataset,
+    filter_minari_cache,
     load_objects,
+    precompute_minari_for_keys,
     precompute_trajectories,
+    split_minari_episodes,
     split_objects,
 )
 from sft_config import SFTConfig  # noqa: E402
@@ -149,34 +152,63 @@ def eval_metrics(
     return avg_loss, emb_acc, gen_acc
 
 
+def _build_minari_datasets(cfg: SFTConfig, tokenizer, image_processor):
+    from minari_adapter import iterate_episode_ids, load_minari_dataset  # noqa: WPS433
+
+    all_keys: list[tuple[str, int]] = []
+    for dataset_id in cfg.minari_datasets:
+        ds = load_minari_dataset(dataset_id, download=cfg.minari_download)
+        for ep_id in iterate_episode_ids(ds, cfg.max_episodes_per_dataset):
+            all_keys.append((dataset_id, ep_id))
+
+    train_keys, val_keys = split_minari_episodes(all_keys, cfg.val_ratio, cfg.seed)
+    log(f"Minari episodes: total={len(all_keys)} train={len(train_keys)} val={len(val_keys)}")
+
+    log("Replaying Minari episodes with RGB partial observations...")
+    t0 = time.time()
+    full_cache = precompute_minari_for_keys(
+        all_keys,
+        download=False,
+        tile_size=cfg.minari_tile_size,
+        log_every=cfg.replay_log_every,
+    )
+    train_cache = filter_minari_cache(full_cache, train_keys)
+    val_cache = filter_minari_cache(full_cache, val_keys)
+    train_steps = sum(len(v) for v in train_cache.values())
+    val_steps = sum(len(v) for v in val_cache.values())
+    log(
+        f"Steps: train={train_steps}, val={val_steps} "
+        f"(replayed in {time.time() - t0:.1f}s)"
+    )
+
+    train_ds = MiniGridSFTDataset.from_minari(
+        cfg.minari_datasets,
+        tokenizer,
+        image_processor,
+        trajectory_cache=train_cache,
+        download=False,
+        tile_size=cfg.minari_tile_size,
+    )
+    val_ds = MiniGridSFTDataset.from_minari(
+        cfg.minari_datasets,
+        tokenizer,
+        image_processor,
+        trajectory_cache=val_cache,
+        download=False,
+        tile_size=cfg.minari_tile_size,
+    )
+    return train_ds, val_ds
+
+
 def train_sft(cfg: SFTConfig) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = cfg.use_amp and device.type == "cuda"
     amp_dtype = torch.bfloat16 if use_amp else torch.float32
 
     log("=" * 60)
-    log("nanoVLM SFT — MiniGrid expert fine-tuning")
+    log("nanoVLM SFT — MiniGrid / BabyAI expert fine-tuning")
     log("=" * 60)
     log(f"Device: {device} | AMP: {use_amp}")
-
-    objects = load_objects(Path(cfg.dataset_path))
-    if cfg.max_objects is not None:
-        objects = objects[: cfg.max_objects]
-    log(f"Mazes in dataset: {len(objects)}")
-
-    train_objs, val_objs = split_objects(objects, cfg.val_ratio, cfg.seed)
-    log(f"Train mazes: {len(train_objs)} | Val mazes: {len(val_objs)}")
-
-    log("Precomputing expert trajectories (BFS on x,y,dir)...")
-    t0 = time.time()
-    train_cache = precompute_trajectories(train_objs)
-    val_cache = precompute_trajectories(val_objs)
-    train_steps = sum(len(v) for v in train_cache.values())
-    val_steps = sum(len(v) for v in val_cache.values())
-    log(
-        f"Steps: train={train_steps}, val={val_steps} "
-        f"(built in {time.time() - t0:.1f}s)"
-    )
 
     log(f"Loading pretrained VLM from: {cfg.pretrained_path}")
     model = VisionLanguageModel.from_pretrained(cfg.pretrained_path)
@@ -187,8 +219,30 @@ def train_sft(cfg: SFTConfig) -> None:
     tokenizer = get_tokenizer(model.cfg.lm_tokenizer)
     image_processor = get_image_processor(model.cfg.vit_img_size)
 
-    train_ds = MiniGridSFTDataset(train_objs, tokenizer, image_processor, train_cache)
-    val_ds = MiniGridSFTDataset(val_objs, tokenizer, image_processor, val_cache)
+    if cfg.minari_datasets:
+        log(f"Data source: Minari ({len(cfg.minari_datasets)} datasets)")
+        train_ds, val_ds = _build_minari_datasets(cfg, tokenizer, image_processor)
+    else:
+        objects = load_objects(Path(cfg.dataset_path))
+        if cfg.max_objects is not None:
+            objects = objects[: cfg.max_objects]
+        log(f"Data source: JSON mazes ({len(objects)} objects)")
+
+        train_objs, val_objs = split_objects(objects, cfg.val_ratio, cfg.seed)
+        log(f"Train mazes: {len(train_objs)} | Val mazes: {len(val_objs)}")
+
+        log("Precomputing expert trajectories (BFS on x,y,dir)...")
+        t0 = time.time()
+        train_cache = precompute_trajectories(train_objs)
+        val_cache = precompute_trajectories(val_objs)
+        train_steps = sum(len(v) for v in train_cache.values())
+        val_steps = sum(len(v) for v in val_cache.values())
+        log(
+            f"Steps: train={train_steps}, val={val_steps} "
+            f"(built in {time.time() - t0:.1f}s)"
+        )
+        train_ds = MiniGridSFTDataset(train_objs, tokenizer, image_processor, train_cache)
+        val_ds = MiniGridSFTDataset(val_objs, tokenizer, image_processor, val_cache)
 
     collator = MiniGridSFTCollator(tokenizer, model.cfg.lm_max_length)
     train_loader = DataLoader(
@@ -359,9 +413,24 @@ def main() -> None:
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--lr-mp", type=float, default=None)
     parser.add_argument("--lr-backbones", type=float, default=None)
+    parser.add_argument(
+        "--no-minari",
+        action="store_true",
+        help="Use legacy Datasets/dataset.json instead of Minari BabyAI data",
+    )
+    parser.add_argument(
+        "--max-episodes-per-dataset",
+        type=int,
+        default=None,
+        help="Cap episodes replayed per Minari dataset (debug/smoke)",
+    )
     args = parser.parse_args()
 
     cfg = SFTConfig()
+    if args.no_minari:
+        cfg.minari_datasets = []
+    if args.max_episodes_per_dataset is not None:
+        cfg.max_episodes_per_dataset = args.max_episodes_per_dataset
     if args.epochs is not None:
         cfg.epochs = args.epochs
     if args.batch_size is not None:

@@ -9,3 +9,6 @@ datasets>=2.18.0
 wandb>=0.17.0
 gymnasium>=0.29.0
 minigrid>=2.3.1
+minari>=0.5.0
+h5py>=3.8.0
+huggingface_hub>=0.20.0
