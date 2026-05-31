@@ -57,6 +57,7 @@ from minigrid_sft_dataset import (  # noqa: E402
     precompute_minari_for_keys,
     precompute_trajectories,
     split_minari_episodes,
+    subsample_list,
     split_objects,
 )
 from sft_config import SFTConfig  # noqa: E402
@@ -162,12 +163,17 @@ def _build_minari_datasets(cfg: SFTConfig, tokenizer, image_processor):
             all_keys.append((dataset_id, ep_id))
 
     train_keys, val_keys = split_minari_episodes(all_keys, cfg.val_ratio, cfg.seed)
-    log(f"Minari episodes: total={len(all_keys)} train={len(train_keys)} val={len(val_keys)}")
+    val_keys = subsample_list(val_keys, cfg.val_subsample, cfg.seed + 1)
+    log(
+        f"Minari episodes: total={len(all_keys)} train={len(train_keys)} "
+        f"val={len(val_keys)} (val_subsample={cfg.val_subsample})"
+    )
 
     log("Replaying Minari episodes with RGB partial observations...")
     t0 = time.time()
+    replay_keys = train_keys + val_keys
     full_cache = precompute_minari_for_keys(
-        all_keys,
+        replay_keys,
         download=False,
         tile_size=cfg.minari_tile_size,
         log_every=cfg.replay_log_every,
@@ -229,6 +235,7 @@ def train_sft(cfg: SFTConfig) -> None:
         log(f"Data source: JSON mazes ({len(objects)} objects)")
 
         train_objs, val_objs = split_objects(objects, cfg.val_ratio, cfg.seed)
+        val_objs = subsample_list(val_objs, cfg.val_subsample, cfg.seed + 1)
         log(f"Train mazes: {len(train_objs)} | Val mazes: {len(val_objs)}")
 
         log("Precomputing expert trajectories (BFS on x,y,dir)...")

@@ -30,6 +30,7 @@ class SFTConfig:
     # Legacy JSON maze dataset (unused when minari_datasets is non-empty)
     dataset_path: str = str(DATASET_JSON)
     val_ratio: float = 0.1
+    val_subsample: float = 0.1  # keep this fraction of val episodes (0.1 → 10× smaller val)
     seed: int = 0
 
     epochs: int = 3
