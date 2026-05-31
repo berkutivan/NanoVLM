@@ -1,5 +1,5 @@
 Description_project.md
-checkpoints/
+checkpoints/**/.cache/
 *.zip
 .venv/
 

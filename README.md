@@ -25,5 +25,6 @@ python Training_model/train_sft.py
 
 ## Notes
 
-- `checkpoints/`, `.venv/` and `*.zip` are intentionally ignored by git.
-- Pretrained weights are pulled from Hugging Face Hub by default (see `Training_model/sft_pipeline.ipynb`).
+- Model weights under `checkpoints/` are tracked with **Git LFS** (`*.safetensors`). Run `git lfs install` after clone.
+- `.venv/` and `*.zip` are ignored by git.
+- Fallback: pretrained weights can still be pulled from Hugging Face Hub (`lusxvr/nanoVLM-222M`; see `Training_model/sft_pipeline.ipynb`).
