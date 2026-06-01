@@ -31,6 +31,7 @@ class SFTConfig:
     dataset_path: str = str(DATASET_JSON)
     val_ratio: float = 0.1
     val_subsample: float = 0.1  # keep this fraction of val episodes (0.1 → 10× smaller val)
+    train_subsample: float = 1.0  # fraction of train steps after replay (0.1 → 10× smaller train_ds)
     seed: int = 0
 
     epochs: int = 3
@@ -50,6 +51,11 @@ class SFTConfig:
 
     compile_model: bool = False
     use_amp: bool = True  # only applied when CUDA is available
+
+    # Speed / memory: frozen ViT + 8-bit AdamW optimizer states
+    freeze_vision: bool = True
+    use_8bit_optimizer: bool = True
+    unfreeze_lm_blocks: int = 0  # 0 = full decoder; N > 0 = last N blocks only
 
     max_objects: int | None = None  # debug: cap legacy JSON mazes
 

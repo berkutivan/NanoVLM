@@ -5,11 +5,11 @@ Fine-tuning strategy
 --------------------
 1. Load the *full* pretrained VLM from checkpoints/nanoVLM-222M (vision + LM + MP).
 2. Do NOT re-initialize from backbone weights only — that would be continued pre-training.
-3. Optimize all parameters with two learning rates (nanoVLM convention):
+3. Optimize MP + language decoder (ViT frozen by default) with two learning rates:
    - modality projector (MP): higher LR — adapts vision tokens to the new task quickly;
-   - vision encoder + language decoder: lower LR — preserves general VLM features while adapting.
+   - language decoder: lower LR — adapts LM while ViT features stay fixed.
 4. Loss: optimal-set embedding log-loss + CE on answer tokens (trains ``lm_head``).
-   Validation reports embedding accuracy (aligned with log-loss) and constrained greedy gen accuracy.
+   BF16 AMP + optional 8-bit AdamW for faster training / lower VRAM.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import time
 from pathlib import Path
 
 import torch
-import torch.optim as optim
 from torch.utils.data import DataLoader
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,9 +57,16 @@ from minigrid_sft_dataset import (  # noqa: E402
     precompute_trajectories,
     split_minari_episodes,
     subsample_list,
+    subsample_dataset,
     split_objects,
 )
 from sft_config import SFTConfig  # noqa: E402
+from sft_train_utils import (  # noqa: E402
+    build_sft_optimizer,
+    freeze_for_sft,
+    sft_param_groups,
+    trainable_parameters,
+)
 
 import os
 
@@ -183,8 +189,9 @@ def _build_minari_datasets(cfg: SFTConfig, tokenizer, image_processor):
     train_steps = sum(len(v) for v in train_cache.values())
     val_steps = sum(len(v) for v in val_cache.values())
     log(
-        f"Steps: train={train_steps}, val={val_steps} "
-        f"(replayed in {time.time() - t0:.1f}s)"
+        f"Replayed steps: train={train_steps} ({len(train_keys)} episodes), "
+        f"val={val_steps} ({len(val_keys)} episodes) "
+        f"in {time.time() - t0:.1f}s"
     )
 
     train_ds = MiniGridSFTDataset.from_minari(
@@ -195,6 +202,13 @@ def _build_minari_datasets(cfg: SFTConfig, tokenizer, image_processor):
         download=False,
         tile_size=cfg.minari_tile_size,
     )
+    if cfg.train_subsample < 1.0:
+        n_before = len(train_ds)
+        train_ds = subsample_dataset(train_ds, cfg.train_subsample, cfg.seed + 2)
+        log(
+            f"train_ds: {n_before} steps → {len(train_ds)} "
+            f"(train_subsample={cfg.train_subsample}, episodes={len(train_keys)})"
+        )
     val_ds = MiniGridSFTDataset.from_minari(
         cfg.minari_datasets,
         tokenizer,
@@ -218,9 +232,15 @@ def train_sft(cfg: SFTConfig) -> None:
 
     log(f"Loading pretrained VLM from: {cfg.pretrained_path}")
     model = VisionLanguageModel.from_pretrained(cfg.pretrained_path)
-    n_params = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log(f"Parameters: {n_params:,} total, {trainable:,} trainable (fine-tune all)")
+    trainable, n_params = freeze_for_sft(
+        model,
+        freeze_vision=cfg.freeze_vision,
+        unfreeze_lm_blocks=cfg.unfreeze_lm_blocks,
+    )
+    log(
+        f"Parameters: {n_params:,} total, {trainable:,} trainable "
+        f"(freeze_vision={cfg.freeze_vision}, unfreeze_lm_blocks={cfg.unfreeze_lm_blocks})"
+    )
 
     tokenizer = get_tokenizer(model.cfg.lm_tokenizer)
     image_processor = get_image_processor(model.cfg.vit_img_size)
@@ -271,15 +291,12 @@ def train_sft(cfg: SFTConfig) -> None:
         drop_last=False,
     )
 
-    param_groups = [
-        {"params": model.MP.parameters(), "lr": cfg.lr_mp, "name": "mp"},
-        {
-            "params": list(model.decoder.parameters()) + list(model.vision_encoder.parameters()),
-            "lr": cfg.lr_backbones,
-            "name": "backbones",
-        },
-    ]
-    optimizer = optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
+    param_groups = sft_param_groups(model, cfg.lr_mp, cfg.lr_backbones)
+    optimizer = build_sft_optimizer(
+        param_groups,
+        weight_decay=cfg.weight_decay,
+        use_8bit=cfg.use_8bit_optimizer and device.type == "cuda",
+    )
     model.to(device)
     if cfg.compile_model and device.type == "cuda":
         model = torch.compile(model)
@@ -294,9 +311,10 @@ def train_sft(cfg: SFTConfig) -> None:
     global_step = 0
     best_val_acc = -1.0
 
+    opt_label = "AdamW8bit" if cfg.use_8bit_optimizer and device.type == "cuda" else "AdamW"
     log(
         f"Training: {cfg.epochs} epochs, batch_size={cfg.batch_size}, "
-        f"lr_mp={cfg.lr_mp}, lr_backbones={cfg.lr_backbones}"
+        f"lr_mp={cfg.lr_mp}, lr_decoder={cfg.lr_backbones}, optimizer={opt_label}"
     )
     log(
         "Loss: optimal-set log-loss + CE on answer tokens "
@@ -349,7 +367,7 @@ def train_sft(cfg: SFTConfig) -> None:
 
             do_step = (batch_idx + 1) % cfg.grad_accum_steps == 0
             if do_step:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(trainable_parameters(model), cfg.max_grad_norm)
                 optimizer.param_groups[0]["lr"] = get_lr(global_step, cfg.lr_mp, max_steps)
                 optimizer.param_groups[1]["lr"] = get_lr(
                     global_step, cfg.lr_backbones, max_steps
@@ -421,6 +439,22 @@ def main() -> None:
     parser.add_argument("--lr-mp", type=float, default=None)
     parser.add_argument("--lr-backbones", type=float, default=None)
     parser.add_argument(
+        "--no-freeze-vision",
+        action="store_true",
+        help="Train ViT weights (default: ViT frozen)",
+    )
+    parser.add_argument(
+        "--no-8bit-optimizer",
+        action="store_true",
+        help="Use standard AdamW instead of bitsandbytes 8-bit",
+    )
+    parser.add_argument(
+        "--unfreeze-lm-blocks",
+        type=int,
+        default=None,
+        help="Train only last N LM blocks (0 = full decoder, default from config)",
+    )
+    parser.add_argument(
         "--no-minari",
         action="store_true",
         help="Use legacy Datasets/dataset.json instead of Minari BabyAI data",
@@ -452,6 +486,12 @@ def main() -> None:
         cfg.lr_mp = args.lr_mp
     if args.lr_backbones is not None:
         cfg.lr_backbones = args.lr_backbones
+    if args.no_freeze_vision:
+        cfg.freeze_vision = False
+    if args.no_8bit_optimizer:
+        cfg.use_8bit_optimizer = False
+    if args.unfreeze_lm_blocks is not None:
+        cfg.unfreeze_lm_blocks = args.unfreeze_lm_blocks
 
     train_sft(cfg)
 

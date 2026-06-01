@@ -10,3 +10,4 @@ minigrid>=2.3.1
 minari>=0.5.0
 h5py>=3.8.0
 huggingface_hub>=0.20.0
+bitsandbytes>=0.43.0

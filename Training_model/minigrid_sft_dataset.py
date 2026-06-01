@@ -189,7 +189,7 @@ def split_objects(
 
 
 def subsample_list(items: list[Any], fraction: float, seed: int) -> list[Any]:
-    """Keep ``fraction`` of items (at least 1). fraction=0.1 → 10× smaller set."""
+    """Keep ``fraction`` of list items (e.g. episodes). Not the same as step/sample count."""
     if fraction >= 1.0 or len(items) <= 1:
         return list(items)
     rng = random.Random(seed)
@@ -197,6 +197,19 @@ def subsample_list(items: list[Any], fraction: float, seed: int) -> list[Any]:
     rng.shuffle(shuffled)
     n = max(1, int(len(shuffled) * fraction))
     return shuffled[:n]
+
+
+def subsample_dataset(dataset: Dataset, fraction: float, seed: int) -> Dataset:
+    """Random subset of dataset **steps/samples** (len(train_ds)), not episodes."""
+    from torch.utils.data import Subset
+
+    n = len(dataset)
+    if fraction >= 1.0 or n <= 1:
+        return dataset
+    rng = random.Random(seed)
+    n_keep = max(1, int(n * fraction))
+    indices = rng.sample(range(n), n_keep)
+    return Subset(dataset, indices)
 
 
 def split_minari_episodes(
