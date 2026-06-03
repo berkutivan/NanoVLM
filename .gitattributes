@@ -1,1 +1,2 @@
 *.safetensors filter=lfs diff=lfs merge=lfs -text
+Datasets/babyai_curated/episodes/*.npz filter=lfs diff=lfs merge=lfs -text

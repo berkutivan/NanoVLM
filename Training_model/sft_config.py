@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DATASET_JSON = ROOT / "Datasets" / "dataset.json"
 PRETRAINED_CKPT = ROOT / "checkpoints" / "nanoVLM-222M"
 SFT_OUTPUT_DIR = ROOT / "checkpoints" / "sft-minigrid"
+CURATED_DATASET_DIR = ROOT / "Datasets" / "babyai_curated"
 
 DEFAULT_MINARI_DATASETS: tuple[str, ...] = (
     "minigrid/BabyAI-GoToObjMazeOpen/optimal-v0",
@@ -21,7 +22,10 @@ class SFTConfig:
     pretrained_path: str = str(PRETRAINED_CKPT)
     output_dir: str = str(SFT_OUTPUT_DIR)
 
-    # Minari BabyAI maze/navigation (Variant A)
+    # Pre-built FOV-filtered BabyAI dataset (see build_babyai_curated_dataset.py)
+    curated_dataset_path: str = str(CURATED_DATASET_DIR)
+
+    # Minari BabyAI maze/navigation (Variant A); ignored when curated manifest exists
     minari_datasets: list[str] = field(default_factory=lambda: list(DEFAULT_MINARI_DATASETS))
     minari_download: bool = True
     minari_tile_size: int = 8

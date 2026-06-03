@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
 
@@ -55,6 +56,52 @@ def build_minari_flat_index(
     return flat
 
 
+def build_curated_flat_index(
+    trajectory_cache: dict[int, list[ExpertStep]],
+) -> list[tuple[int, int]]:
+    flat: list[tuple[int, int]] = []
+    for episode_id, steps in trajectory_cache.items():
+        for step_idx in range(len(steps)):
+            flat.append((episode_id, step_idx))
+    return flat
+
+
+def load_curated_trajectories(curated_dir: Path) -> tuple[dict[str, Any], dict[int, list[ExpertStep]]]:
+    """Load manifest + ExpertStep lists from ``babyai_curated`` npz episodes."""
+    curated_dir = Path(curated_dir)
+    manifest_path = curated_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"curated manifest not found: {manifest_path}")
+
+    with manifest_path.open(encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    cache: dict[int, list[ExpertStep]] = {}
+    for ep in manifest.get("episodes", []):
+        ep_id = int(ep["id"])
+        npz_path = curated_dir / ep["file"]
+        data = np.load(npz_path, allow_pickle=True)
+        images = data["images"]
+        actions = data["actions"]
+        action_ids = data["action_ids"]
+        missions = data["missions"]
+        steps: list[ExpertStep] = []
+        for i in range(len(images)):
+            allowed = (str(actions[i]),)
+            steps.append(
+                ExpertStep(
+                    image=np.asarray(images[i], dtype=np.uint8),
+                    mission=str(missions[i]),
+                    action=str(actions[i]),
+                    action_id=int(action_ids[i]),
+                    allowed_actions=allowed,
+                    step_index=i,
+                )
+            )
+        cache[ep_id] = steps
+    return manifest, cache
+
+
 class MiniGridSFTDataset(Dataset):
     def __init__(
         self,
@@ -69,6 +116,8 @@ class MiniGridSFTDataset(Dataset):
         self.image_processor = image_processor
         self.minari_cache: dict[tuple[str, int], list[ExpertStep]] | None = None
         self.minari_flat: list[tuple[str, int, int]] = []
+        self.curated_cache: dict[int, list[ExpertStep]] | None = None
+        self.curated_flat: list[tuple[int, int]] = []
 
         if trajectory_cache is None:
             trajectory_cache = {}
@@ -123,9 +172,38 @@ class MiniGridSFTDataset(Dataset):
         self.flat = []
         return self
 
+    @classmethod
+    def from_curated(
+        cls,
+        tokenizer,
+        image_processor,
+        *,
+        curated_dir: Path | str | None = None,
+        trajectory_cache: dict[int, list[ExpertStep]] | None = None,
+    ) -> MiniGridSFTDataset:
+        if trajectory_cache is None:
+            if curated_dir is None:
+                raise ValueError("curated_dir or trajectory_cache is required")
+            _, trajectory_cache = load_curated_trajectories(Path(curated_dir))
+
+        self = cls.__new__(cls)
+        self.source = "curated"
+        self.objects = []
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        self.trajectory_cache = {}
+        self.minari_cache = None
+        self.minari_flat = []
+        self.curated_cache = trajectory_cache
+        self.curated_flat = build_curated_flat_index(trajectory_cache)
+        self.flat = []
+        return self
+
     def __len__(self) -> int:
         if self.source == "minari":
             return len(self.minari_flat)
+        if self.source == "curated":
+            return len(self.curated_flat)
         return len(self.flat)
 
     def _item_from_step(
@@ -161,6 +239,16 @@ class MiniGridSFTDataset(Dataset):
             return self._item_from_step(
                 step,
                 object_id=f"{dataset_id}:{episode_id}",
+                step_index=step.step_index,
+            )
+
+        if self.source == "curated":
+            assert self.curated_cache is not None
+            episode_id, step_idx = self.curated_flat[idx]
+            step = self.curated_cache[episode_id][step_idx]
+            return self._item_from_step(
+                step,
+                object_id=f"curated:{episode_id}",
                 step_index=step.step_index,
             )
 
@@ -210,6 +298,30 @@ def subsample_dataset(dataset: Dataset, fraction: float, seed: int) -> Dataset:
     n_keep = max(1, int(n * fraction))
     indices = rng.sample(range(n), n_keep)
     return Subset(dataset, indices)
+
+
+def split_curated_episodes(
+    episode_ids: list[int],
+    val_ratio: float,
+    seed: int,
+) -> tuple[list[int], list[int]]:
+    """Episode-level train/val split for curated BabyAI dataset."""
+    rng = random.Random(seed)
+    ids = list(episode_ids)
+    rng.shuffle(ids)
+    val_count = max(1, int(len(ids) * val_ratio)) if len(ids) > 1 else 0
+    val_set = set(ids[:val_count])
+    train = [i for i in ids if i not in val_set]
+    val = [i for i in ids if i in val_set]
+    return train, val
+
+
+def filter_curated_cache(
+    cache: dict[int, list[ExpertStep]],
+    episode_ids: list[int],
+) -> dict[int, list[ExpertStep]]:
+    allowed = set(episode_ids)
+    return {k: v for k, v in cache.items() if k in allowed}
 
 
 def split_minari_episodes(

@@ -51,10 +51,13 @@ from models.vision_language_model import VisionLanguageModel  # noqa: E402
 
 from minigrid_sft_dataset import (  # noqa: E402
     MiniGridSFTDataset,
+    filter_curated_cache,
     filter_minari_cache,
+    load_curated_trajectories,
     load_objects,
     precompute_minari_for_keys,
     precompute_trajectories,
+    split_curated_episodes,
     split_minari_episodes,
     subsample_list,
     subsample_dataset,
@@ -159,6 +162,52 @@ def eval_metrics(
     return avg_loss, emb_acc, gen_acc
 
 
+def _curated_manifest_path(cfg: SFTConfig) -> Path:
+    return Path(cfg.curated_dataset_path) / "manifest.json"
+
+
+def _build_curated_datasets(cfg: SFTConfig, tokenizer, image_processor):
+    curated_dir = Path(cfg.curated_dataset_path)
+    manifest, full_cache = load_curated_trajectories(curated_dir)
+    all_ids = sorted(full_cache.keys())
+    train_ids, val_ids = split_curated_episodes(all_ids, cfg.val_ratio, cfg.seed)
+    val_ids = subsample_list(val_ids, cfg.val_subsample, cfg.seed + 1)
+    log(
+        f"Curated episodes: total={manifest.get('n_episodes', len(all_ids))} "
+        f"train={len(train_ids)} val={len(val_ids)}"
+    )
+    log(
+        f"  FOV-filtered steps: {manifest.get('n_steps', '?')} "
+        f"(direct={manifest.get('n_direct_steps', '?')}, "
+        f"explore={manifest.get('n_explore_steps', '?')})"
+    )
+
+    train_cache = filter_curated_cache(full_cache, train_ids)
+    val_cache = filter_curated_cache(full_cache, val_ids)
+    train_steps = sum(len(v) for v in train_cache.values())
+    val_steps = sum(len(v) for v in val_cache.values())
+    log(f"  split steps: train={train_steps} val={val_steps}")
+
+    train_ds = MiniGridSFTDataset.from_curated(
+        tokenizer,
+        image_processor,
+        trajectory_cache=train_cache,
+    )
+    if cfg.train_subsample < 1.0:
+        n_before = len(train_ds)
+        train_ds = subsample_dataset(train_ds, cfg.train_subsample, cfg.seed + 2)
+        log(
+            f"train_ds: {n_before} steps → {len(train_ds)} "
+            f"(train_subsample={cfg.train_subsample})"
+        )
+    val_ds = MiniGridSFTDataset.from_curated(
+        tokenizer,
+        image_processor,
+        trajectory_cache=val_cache,
+    )
+    return train_ds, val_ds
+
+
 def _build_minari_datasets(cfg: SFTConfig, tokenizer, image_processor):
     from minari_adapter import iterate_episode_ids, load_minari_dataset  # noqa: WPS433
 
@@ -245,7 +294,10 @@ def train_sft(cfg: SFTConfig) -> None:
     tokenizer = get_tokenizer(model.cfg.lm_tokenizer)
     image_processor = get_image_processor(model.cfg.vit_img_size)
 
-    if cfg.minari_datasets:
+    if _curated_manifest_path(cfg).is_file():
+        log(f"Data source: curated BabyAI ({cfg.curated_dataset_path})")
+        train_ds, val_ds = _build_curated_datasets(cfg, tokenizer, image_processor)
+    elif cfg.minari_datasets:
         log(f"Data source: Minari ({len(cfg.minari_datasets)} datasets)")
         train_ds, val_ds = _build_minari_datasets(cfg, tokenizer, image_processor)
     else:
