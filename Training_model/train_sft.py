@@ -193,6 +193,9 @@ def _build_curated_datasets(cfg: SFTConfig, tokenizer, image_processor):
         image_processor,
         trajectory_cache=train_cache,
     )
+    if cfg.balance_train_actions:
+        info = train_ds.balance_explore_actions(cfg.seed + 3)
+        log(f"Balanced train actions (left/right/forward): {info}")
     if cfg.train_subsample < 1.0:
         n_before = len(train_ds)
         train_ds = subsample_dataset(train_ds, cfg.train_subsample, cfg.seed + 2)
@@ -251,6 +254,9 @@ def _build_minari_datasets(cfg: SFTConfig, tokenizer, image_processor):
         download=False,
         tile_size=cfg.minari_tile_size,
     )
+    if cfg.balance_train_actions:
+        info = train_ds.balance_explore_actions(cfg.seed + 3)
+        log(f"Balanced train actions (left/right/forward): {info}")
     if cfg.train_subsample < 1.0:
         n_before = len(train_ds)
         train_ds = subsample_dataset(train_ds, cfg.train_subsample, cfg.seed + 2)
@@ -322,6 +328,9 @@ def train_sft(cfg: SFTConfig) -> None:
         )
         train_ds = MiniGridSFTDataset(train_objs, tokenizer, image_processor, train_cache)
         val_ds = MiniGridSFTDataset(val_objs, tokenizer, image_processor, val_cache)
+        if cfg.balance_train_actions:
+            info = train_ds.balance_explore_actions(cfg.seed + 3)
+            log(f"Balanced train actions (left/right/forward): {info}")
 
     collator = MiniGridSFTCollator(tokenizer, model.cfg.lm_max_length)
     train_loader = DataLoader(

@@ -22,6 +22,7 @@ for p in (str(DATASETS_DIR), str(TRAINING_DIR)):
 from maze_expert import ExpertStep, rollout_expert_trajectory  # noqa: E402
 
 ACTIONS_PROMPT = "left, right, forward, pickup, drop, toggle, or done"
+EXPLORE_BALANCE_ACTIONS = ("left", "right", "forward")
 PROMPT_TEMPLATE = (
     "Mission: {mission}\n"
     f"What is the next action? Answer with one word: {ACTIONS_PROMPT}.\n"
@@ -64,6 +65,59 @@ def build_curated_flat_index(
         for step_idx in range(len(steps)):
             flat.append((episode_id, step_idx))
     return flat
+
+
+def count_actions_in_flat(
+    flat: list[Any],
+    action_at: Any,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for entry in flat:
+        act = action_at(entry)
+        counts[act] = counts.get(act, 0) + 1
+    return counts
+
+
+def balance_explore_actions_in_flat(
+    flat: list[Any],
+    action_at: Any,
+    *,
+    balance_actions: tuple[str, ...] = EXPLORE_BALANCE_ACTIONS,
+    seed: int = 0,
+) -> tuple[list[Any], dict[str, Any]]:
+    """
+    Undersample left/right/forward so each has the same count (min class size).
+    Steps with other actions (pickup, drop, …) are kept unchanged.
+    """
+    rng = random.Random(seed)
+    pools: dict[str, list[Any]] = {a: [] for a in balance_actions}
+    other: list[Any] = []
+    for entry in flat:
+        act = action_at(entry)
+        if act in pools:
+            pools[act].append(entry)
+        else:
+            other.append(entry)
+
+    per_class = {a: len(pools[a]) for a in balance_actions}
+    target = min(per_class.values()) if per_class else 0
+    if target == 0:
+        return list(flat), {"skipped": True, "reason": "empty class", "before": per_class}
+
+    balanced: list[Any] = []
+    for a in balance_actions:
+        pool = pools[a]
+        balanced.extend(rng.sample(pool, target) if len(pool) > target else pool)
+    balanced.extend(other)
+    rng.shuffle(balanced)
+    after = {a: target for a in balance_actions}
+    return balanced, {
+        "before": per_class,
+        "after": after,
+        "target_per_class": target,
+        "other_kept": len(other),
+        "total": len(balanced),
+    }
 
 
 def load_curated_trajectories(curated_dir: Path) -> tuple[dict[str, Any], dict[int, list[ExpertStep]]]:
@@ -205,6 +259,50 @@ class MiniGridSFTDataset(Dataset):
         if self.source == "curated":
             return len(self.curated_flat)
         return len(self.flat)
+
+    def _flat_entries(self) -> list[Any]:
+        if self.source == "minari":
+            return self.minari_flat
+        if self.source == "curated":
+            return self.curated_flat
+        return self.flat
+
+    def _set_flat_entries(self, flat: list[Any]) -> None:
+        if self.source == "minari":
+            self.minari_flat = flat
+        elif self.source == "curated":
+            self.curated_flat = flat
+        else:
+            self.flat = flat
+
+    def _action_for_entry(self, entry: Any) -> str:
+        if self.source == "minari":
+            assert self.minari_cache is not None
+            dataset_id, episode_id, step_idx = entry
+            return self.minari_cache[(dataset_id, episode_id)][step_idx].action
+        if self.source == "curated":
+            assert self.curated_cache is not None
+            episode_id, step_idx = entry
+            return self.curated_cache[episode_id][step_idx].action
+        obj_idx, step_idx = entry
+        return self.trajectory_cache[obj_idx][step_idx].action
+
+    def count_actions(self) -> dict[str, int]:
+        return count_actions_in_flat(self._flat_entries(), self._action_for_entry)
+
+    def balance_explore_actions(self, seed: int = 0) -> dict[str, Any]:
+        """Equalize left/right/forward counts; other action types are unchanged."""
+        flat = self._flat_entries()
+        n_before = len(flat)
+        balanced, info = balance_explore_actions_in_flat(
+            flat,
+            self._action_for_entry,
+            seed=seed,
+        )
+        self._set_flat_entries(balanced)
+        info["steps_before"] = n_before
+        info["steps_after"] = len(balanced)
+        return info
 
     def _item_from_step(
         self,

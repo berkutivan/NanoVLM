@@ -36,6 +36,7 @@ class SFTConfig:
     val_ratio: float = 0.1
     val_subsample: float = 0.1  # keep this fraction of val episodes (0.1 → 10× smaller val)
     train_subsample: float = 1.0  # fraction of train steps after replay (0.1 → 10× smaller train_ds)
+    balance_train_actions: bool = True  # equal left/right/forward counts on train_ds (undersample)
     seed: int = 0
 
     epochs: int = 3
